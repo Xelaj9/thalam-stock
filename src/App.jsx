@@ -270,7 +270,7 @@ export default function App() {
   const saveProduct=async()=>{
     if(!form.name||form.current_stock===""||!form.min_stock||!form.alert_threshold||!form.unit_price){showToast("กรุณากรอกข้อมูลให้ครบ","err");return;}
     const payload={name:form.name,category:form.category,unit:form.unit,current_stock:+form.current_stock,min_stock:+form.min_stock,alert_threshold:+form.alert_threshold,unit_price:+form.unit_price};
-    if(editId){const {data}=await supabase.from("products").update(payload).eq("id",editId).select().single();if(data){setProducts(p=>p.map(x=>x.id===editId?data:x));showToast("แก้ไขสำเร็จ ✓");}}
+    if(editId){const {data}=await supabase.from("products").upsert({...payload,id:editId}).select().single();if(data){setProducts(p=>p.map(x=>x.id===editId?data:x));showToast("แก้ไขสำเร็จ ✓");}}
     else{const {data}=await supabase.from("products").insert(payload).select().single();if(data){setProducts(p=>[...p,data]);showToast("เพิ่มสินค้าสำเร็จ ✓");}}
     setModal(null);
   };
@@ -283,15 +283,20 @@ export default function App() {
   const adjStock=async(id,delta)=>{
     const p=products.find(x=>x.id===id);
     const ns=Math.max(0,p.current_stock+delta);
-    const {data}=await supabase.from("products").update({current_stock:ns}).eq("id",id).select().single();
+    const {data}=await supabase.from("products").upsert({...p,current_stock:ns}).select().single();
     if(data)setProducts(p=>p.map(x=>x.id===id?data:x));
   };
 
   // ── SETTINGS ───────────────────────────────────
   const saveSettingsDB=useCallback(async s=>{
     setSettings(s);
-    if(settingsId)await supabase.from("settings").update(s).eq("id",settingsId);
-    else{const {data}=await supabase.from("settings").insert(s).select().single();if(data)setSettingsId(data.id);}
+    if(settingsId){
+      const {data}=await supabase.from("settings").upsert({...s,id:settingsId}).select().single();
+      if(data)setSettings(data);
+    } else {
+      const {data}=await supabase.from("settings").insert(s).select().single();
+      if(data){setSettingsId(data.id);setSettings(data);}
+    }
   },[settingsId]);
 
   // ── TELEGRAM SEND ──────────────────────────────
