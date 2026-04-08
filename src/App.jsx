@@ -2,6 +2,18 @@ import { useState, useEffect, useCallback } from "react";
 import { supabase } from "./supabase";
 
 const UNITS = ["ขวด", "กระป๋อง", "แพ็ค", "ลัง", "ลิตร"];
+const PACK_UNITS = ["ลัง", "แพ็ค", "ถาด", "โหล", "ลัง (12)", "ลัง (24)"];
+
+const formatPacks = (amount, p) => {
+  const ps = +p.pack_size;
+  if (!ps || ps <= 0 || amount <= 0) return `${amount} ${p.unit}`;
+  const packs = Math.floor(amount / ps);
+  const rem = amount % ps;
+  const pu = p.pack_unit || "ลัง";
+  if (packs === 0) return `${rem} ${p.unit}`;
+  if (rem === 0) return `${packs} ${pu}`;
+  return `${packs} ${pu} + ${rem} ${p.unit}`;
+};
 const C = {
   bg0:"#0a0a0a",bg1:"#111111",bg2:"#1a1a1a",bg3:"#222222",
   green:"#00ff88",greenDim:"#00cc6a",greenDark:"#003d1f",
@@ -94,9 +106,22 @@ option{background:#1a1a1a}
 .cmd-tag{background:#003d1f;color:#00ff88;border:1px solid #00ff8844;border-radius:5px;padding:2px 8px;font-size:12px;white-space:nowrap;flex-shrink:0}
 .cmd-desc{font-size:12px;color:#666;line-height:1.5}
 
-.bn{display:none;position:fixed;bottom:0;left:0;right:0;background:#111;border-top:1px solid #00ff8822;padding:6px 0 10px;z-index:100}
+.cnt-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px}
+.cnt-date{font-size:12px;color:#00ff88;font-weight:700;letter-spacing:1px}
+.cnt-cat{font-size:11px;font-weight:700;color:#666;letter-spacing:2px;text-transform:uppercase;margin:14px 0 8px;padding-bottom:4px;border-bottom:1px solid #1f1f1f}
+.cnt-row{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #111;flex-wrap:wrap}
+.cnt-name{flex:1;min-width:120px}
+.cnt-nm{font-size:14px;font-weight:600}
+.cnt-cur{font-size:11px;color:#666;margin-top:2px}
+.cnt-inp{width:72px;text-align:center;font-size:18px;font-weight:700;padding:6px 8px;flex-shrink:0}
+.cnt-pk{font-size:11px;color:#00ff88;font-weight:700;min-width:90px;text-align:right}
+.cnt-pk-dim{color:#444}
+.pack-hint{font-size:10px;color:#00ff8877;margin-top:3px}
+.pack-tag{background:#003d1f;color:#00ff88;border:1px solid #00ff8844;border-radius:5px;padding:1px 7px;font-size:10px;font-weight:700;white-space:nowrap}
+.hist-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #111;font-size:12px;flex-wrap:wrap;gap:4px}
+bottom:0;left:0;right:0;background:#111;border-top:1px solid #00ff8822;padding:6px 0 10px;z-index:100}
 .bni{display:flex;justify-content:space-around}
-.bnt{background:transparent;border:none;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;padding:4px 8px;color:#666;font-size:10px;font-family:'Courier New',monospace;position:relative}
+.bnt{background:transparent;border:none;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;padding:4px 5px;color:#666;font-size:9px;font-family:'Courier New',monospace;position:relative}
 .bnt.on{color:#00ff88}
 .bnt svg{width:20px;height:20px}
 .ls{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px}
@@ -177,18 +202,23 @@ export default function App() {
   const [editCatName,setEditCatName]=useState("");
   const [webhookStatus,setWebhookStatus]=useState(null); // null=unknown, true=ok, false=no
   const [webhookLoading,setWebhookLoading]=useState(false);
+  const [countDraft,setCountDraft]=useState({});
+  const [countSaving,setCountSaving]=useState(false);
+  const [countHistory,setCountHistory]=useState([]);
 
   useEffect(()=>{
     (async()=>{
       setLoading(true);
-      const [{data:pr},{data:ca},{data:se}]=await Promise.all([
+      const [{data:pr},{data:ca},{data:se},{data:ch}]=await Promise.all([
         supabase.from("products").select("*").order("name"),
         supabase.from("categories").select("*").order("name"),
         supabase.from("settings").select("*").limit(1),
+        supabase.from("stock_counts").select("*").order("created_at",{ascending:false}).limit(50),
       ]);
       if(pr)setProducts(pr);
       if(ca)setCategories(ca);
       if(se?.length>0){setSettings(se[0]);setSettingsId(se[0].id);}
+      if(ch)setCountHistory(ch);
       setLoading(false);
     })();
   },[]);
@@ -233,7 +263,31 @@ export default function App() {
     showToast("ยกเลิก Webhook แล้ว");
   };
 
-  // ── CATEGORY CRUD ──────────────────────────────
+  // ── STOCK COUNT ────────────────────────────────
+  const submitCount=async()=>{
+    const entries=Object.entries(countDraft).filter(([,v])=>v!==""&&!isNaN(+v)&&+v>=0);
+    if(!entries.length){showToast("ยังไม่ได้กรอกจำนวน","err");return;}
+    setCountSaving(true);
+    const date=new Date().toISOString().split("T")[0];
+    const inserts=[];
+    const updatedProds=[...products];
+    for(const [id,val] of entries){
+      const p=products.find(x=>x.id===id);
+      if(!p)continue;
+      inserts.push({counted_at:date,product_id:id,product_name:p.name,previous_stock:p.current_stock,counted_stock:+val});
+      const idx=updatedProds.findIndex(x=>x.id===id);
+      if(idx>=0)updatedProds[idx]={...updatedProds[idx],current_stock:+val};
+      await supabase.from("products").update({current_stock:+val}).eq("id",id);
+    }
+    const {data:inserted}=await supabase.from("stock_counts").insert(inserts).select();
+    if(inserted)setCountHistory(p=>[...inserted,...p].slice(0,50));
+    setProducts(updatedProds);
+    setCountDraft({});
+    showToast(`✓ บันทึกสต็อก ${entries.length} รายการแล้ว`);
+    setCountSaving(false);
+  };
+
+
   const addCat=async()=>{
     const name=newCat.trim();
     if(!name)return;
@@ -265,11 +319,11 @@ export default function App() {
   };
 
   // ── PRODUCT CRUD ───────────────────────────────
-  const openAdd=()=>{setForm({name:"",category:categories[0]?.name||"",unit:UNITS[0],current_stock:"",min_stock:"",alert_threshold:"",unit_price:""});setEditId(null);setModal("product");};
-  const openEdit=p=>{setForm({...p});setEditId(p.id);setModal("product");};
+  const openAdd=()=>{setForm({name:"",category:categories[0]?.name||"",unit:UNITS[0],current_stock:"",min_stock:"",alert_threshold:"",unit_price:"",pack_size:"",pack_unit:"ลัง"});setEditId(null);setModal("product");};
+  const openEdit=p=>{setForm({...p,pack_size:p.pack_size||"",pack_unit:p.pack_unit||"ลัง"});setEditId(p.id);setModal("product");};
   const saveProduct=async()=>{
     if(!form.name||form.current_stock===""||!form.min_stock||!form.alert_threshold||!form.unit_price){showToast("กรุณากรอกข้อมูลให้ครบ","err");return;}
-    const payload={name:form.name,category:form.category,unit:form.unit,current_stock:+form.current_stock,min_stock:+form.min_stock,alert_threshold:+form.alert_threshold,unit_price:+form.unit_price};
+    const payload={name:form.name,category:form.category,unit:form.unit,current_stock:+form.current_stock,min_stock:+form.min_stock,alert_threshold:+form.alert_threshold,unit_price:+form.unit_price,pack_size:form.pack_size?+form.pack_size:null,pack_unit:form.pack_unit||null};
     if(editId){const {data}=await supabase.from("products").upsert({...payload,id:editId}).select().single();if(data){setProducts(p=>p.map(x=>x.id===editId?data:x));showToast("แก้ไขสำเร็จ ✓");}}
     else{const {data}=await supabase.from("products").insert(payload).select().single();if(data){setProducts(p=>[...p,data]);showToast("เพิ่มสินค้าสำเร็จ ✓");}}
     setModal(null);
@@ -313,13 +367,17 @@ export default function App() {
   const buildAlertMsg=items=>{
     let msg=`🏪 <b>${settings.shop_name||"THALAM"} STOCK ALERT</b>\n📅 ${new Date().toLocaleString("th-TH")}\n━━━━━━━━━━━━━━━━━━━\n⚠️ <b>รายการสต็อกต่ำกว่ากำหนด</b>\n\n`;
     let total=0;
-    items.forEach(p=>{const need=p.min_stock-p.current_stock,cost=need*p.unit_price;total+=cost;msg+=`${p.current_stock<=0?"🔴":"🟠"} <b>${p.name}</b>\n   เหลือ: ${p.current_stock} | ขั้นต่ำ: ${p.min_stock} ${p.unit}\n   ต้องซื้อ: <b>${need} ${p.unit}</b> = <b>฿${cost.toLocaleString("th-TH")}</b>\n\n`;});
+    items.forEach(p=>{
+      const need=p.min_stock-p.current_stock,cost=need*p.unit_price;total+=cost;
+      const packStr=p.pack_size&&+p.pack_size>0?` = ${formatPacks(need,p)}`:"";
+      msg+=`${p.current_stock<=0?"🔴":"🟠"} <b>${p.name}</b>\n   เหลือ: ${formatPacks(p.current_stock,p)} | ขั้นต่ำ: ${p.min_stock} ${p.unit}\n   ต้องซื้อ: <b>${need} ${p.unit}${packStr}</b> ≈ <b>฿${cost.toLocaleString("th-TH")}</b>\n\n`;
+    });
     return msg+`━━━━━━━━━━━━━━━━━━━\n💰 <b>รวมที่ต้องเตรียม: ฿${total.toLocaleString("th-TH")}</b>`;
   };
   const buildReportMsg=()=>{
     let msg=`🏪 <b>${settings.shop_name||"THALAM"} STOCK REPORT</b>\n📅 ${new Date().toLocaleString("th-TH")}\n━━━━━━━━━━━━━━━━━━━\n\n`;
     const g={};products.forEach(p=>{if(!g[p.category])g[p.category]=[];g[p.category].push(p);});
-    Object.entries(g).forEach(([cat,items])=>{msg+=`📦 <b>${cat}</b>\n`;items.forEach(p=>{const st=statusOf(p);msg+=`  ${st==="ok"?"✅":st==="low"?"🟡":st==="alert"?"🟠":"🔴"} ${p.name}: ${p.current_stock}/${p.min_stock} ${p.unit}\n`;});msg+="\n";});
+    Object.entries(g).forEach(([cat,items])=>{msg+=`📦 <b>${cat}</b>\n`;items.forEach(p=>{const st=statusOf(p);const packStr=p.pack_size&&+p.pack_size>0?` (${formatPacks(p.current_stock,p)})`:"";msg+=`  ${st==="ok"?"✅":st==="low"?"🟡":st==="alert"?"🟠":"🔴"} ${p.name}: ${p.current_stock}/${p.min_stock} ${p.unit}${packStr}\n`;});msg+="\n";});
     return msg+`━━━━━━━━━━━━━━━━━━━\n📊 ปกติ ${products.filter(p=>statusOf(p)==="ok").length} | ต้องซื้อ ${products.filter(p=>statusOf(p)!=="ok").length} รายการ`;
   };
   const handleAlert=async()=>{setSending(true);const it=products.filter(p=>statusOf(p)!=="ok");if(!it.length){showToast("สต็อกทุกรายการปกติ ✓");setSending(false);return;}if(await sendTG(buildAlertMsg(it),"แจ้งเตือนสต็อกต่ำ"))showToast(`ส่งแจ้งเตือน ${it.length} รายการสำเร็จ ✓`);setSending(false);};
@@ -334,6 +392,7 @@ export default function App() {
 
   const IH=()=><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>;
   const IB=()=><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>;
+  const IK=()=><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg>;
   const IC=()=><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>;
   const IS=()=><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>;
 
@@ -360,7 +419,7 @@ export default function App() {
 
         {/* Tabs */}
         <div className="tabs">
-          {[["dashboard","แดชบอร์ด",0],["stock","จัดการสต็อก",alerts.length],["categories","หมวดหมู่",0],["settings","ตั้งค่า",0]].map(([id,label,cnt])=>(
+          {[["dashboard","แดชบอร์ด",0],["stock","จัดการสต็อก",alerts.length],["count","นับสต็อก",0],["categories","หมวดหมู่",0],["settings","ตั้งค่า",0]].map(([id,label,cnt])=>(
             <button key={id} className={`tb${tab===id?" on":""}`} onClick={()=>setTab(id)}>
               {label}{cnt>0&&<span className="rb">{cnt}</span>}
             </button>
@@ -382,7 +441,7 @@ export default function App() {
             {alerts.map(p=>{const need=Math.max(0,p.min_stock-p.current_stock);return(
               <div key={p.id} className="ar">
                 <div><span style={{fontWeight:600,fontSize:14}}>{p.name}</span><span style={{fontSize:11,color:C.textMuted,marginLeft:8}}>{p.category}</span></div>
-                <div style={{display:"flex",gap:12,flexWrap:"wrap"}}><span style={{fontSize:12,color:C.textMuted}}>{p.current_stock}/{p.min_stock} {p.unit}</span><span style={{fontSize:13,fontWeight:700,color:"#ff6600"}}>+{need} = ฿{(need*p.unit_price).toLocaleString("th-TH")}</span></div>
+                <div style={{display:"flex",gap:12,flexWrap:"wrap"}}><span style={{fontSize:12,color:C.textMuted}}>{p.current_stock}/{p.min_stock} {p.unit}</span><span style={{fontSize:13,fontWeight:700,color:"#ff6600"}}>+{need}{p.pack_size&&+p.pack_size>0?` (${formatPacks(need,p)})`:""} = ฿{(need*p.unit_price).toLocaleString("th-TH")}</span></div>
               </div>
             );})}
             <div className="atot">รวม: ฿{totalCost.toLocaleString("th-TH")}</div>
@@ -417,7 +476,7 @@ export default function App() {
               <div className="ig">
                 <div className="ic"><div className="il">สต็อกคงเหลือ</div><div className="iv" style={{color:s.text,textShadow:`0 0 10px ${s.text}66`}}>{p.current_stock} <span className="iu">{p.unit}</span></div></div>
                 <div className="ic"><div className="il">ขั้นต่ำ / แจ้งเตือน</div><div style={{fontWeight:600,fontSize:15}}>{p.min_stock} / {p.alert_threshold}</div><div className="is" style={{color:C.textMuted}}>{p.unit}</div></div>
-                {need>0&&<div className="ic" style={{background:C.amberBg,border:`1px solid ${C.amber}33`}}><div className="il" style={{color:C.amber}}>ต้องซื้อเพิ่ม</div><div style={{fontWeight:700,fontSize:15,color:C.amber}}>{need} {p.unit}</div><div className="is" style={{color:C.amber}}>฿{(need*p.unit_price).toLocaleString("th-TH")}</div></div>}
+                {need>0&&<div className="ic" style={{background:C.amberBg,border:`1px solid ${C.amber}33`}}><div className="il" style={{color:C.amber}}>ต้องซื้อเพิ่ม</div><div style={{fontWeight:700,fontSize:15,color:C.amber}}>{need} {p.unit}</div>{p.pack_size&&+p.pack_size>0&&<div className="is" style={{color:"#ffcc44",fontWeight:700}}>= {formatPacks(need,p)}</div>}<div className="is" style={{color:C.amber}}>฿{(need*p.unit_price).toLocaleString("th-TH")}</div></div>}
               </div>
               <Bar current={p.current_stock} min={p.min_stock} threshold={p.alert_threshold}/>
               <div className="adjr">
@@ -431,6 +490,75 @@ export default function App() {
             </div>
           );})}
           {filtered.length===0&&<div style={{textAlign:"center",color:C.textMuted,padding:"2rem",fontSize:14}}>ไม่พบสินค้า</div>}
+        </div>}
+
+        {/* COUNT SHEET */}
+        {tab==="count"&&<div>
+          <div className="cnt-hd">
+            <div>
+              <div style={{fontSize:12,fontWeight:700,color:C.green,letterSpacing:2,textTransform:"uppercase"}}>📋 ใบนับสต็อกรายวัน</div>
+              <div style={{fontSize:11,color:C.textMuted,marginTop:3}}>{new Date().toLocaleDateString("th-TH",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</div>
+            </div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              <GBtn onClick={()=>setCountDraft({})} v="o" disabled={countSaving}>ล้างค่า</GBtn>
+              <GBtn onClick={submitCount} v="g" disabled={countSaving||!Object.values(countDraft).some(v=>v!=="")}>{countSaving?"กำลังบันทึก...":"✓ บันทึกสต็อก"}</GBtn>
+            </div>
+          </div>
+
+          {/* Instruction */}
+          <div style={{background:C.bg1,border:`1px solid ${C.borderGreen}`,borderRadius:10,padding:"10px 14px",marginBottom:14,fontSize:12,color:C.textMuted,lineHeight:1.7}}>
+            กรอกจำนวนที่นับได้ · ช่องที่ว่างจะไม่ถูกอัปเดต · กด <b style={{color:C.green}}>บันทึกสต็อก</b> เพื่อซิงค์ข้อมูล
+          </div>
+
+          {/* Products grouped by category */}
+          {Object.entries(
+            products.reduce((g,p)=>{if(!g[p.category])g[p.category]=[];g[p.category].push(p);return g;},{})
+          ).sort(([a],[b])=>a.localeCompare(b,"th")).map(([cat,items])=>(
+            <div key={cat} className="box" style={{marginBottom:12}}>
+              <div className="cnt-cat">{cat}</div>
+              {items.map(p=>{
+                const dv=countDraft[p.id]??"";
+                const previewStock=dv!==""&&!isNaN(+dv)?+dv:null;
+                const previewPack=previewStock!==null&&p.pack_size&&+p.pack_size>0?formatPacks(previewStock,p):null;
+                const changed=dv!==""&&previewStock!==p.current_stock;
+                return(
+                  <div key={p.id} className="cnt-row">
+                    <div className="cnt-name">
+                      <div className="cnt-nm">{p.name}</div>
+                      <div className="cnt-cur">
+                        เดิม: <b style={{color:STATUS[statusOf(p)].text}}>{formatPacks(p.current_stock,p)}</b>
+                        {p.pack_size&&+p.pack_size>0&&<span style={{marginLeft:6,color:C.textDim}}>({p.pack_size}/{p.pack_unit})</span>}
+                      </div>
+                    </div>
+                    <input
+                      className="cnt-inp"
+                      type="number" min="0"
+                      placeholder="?"
+                      value={dv}
+                      style={{border:`1px solid ${changed?"#00ff8888":C.border}`,background:changed?"#001a0a":C.bg2}}
+                      onChange={e=>setCountDraft(d=>({...d,[p.id]:e.target.value}))}
+                    />
+                    <div className="cnt-pk">
+                      {previewPack?<><span style={{fontSize:10,color:C.textMuted}}>= </span>{previewPack}</>
+                       :previewStock!==null?<span className="cnt-pk-dim">{previewStock} {p.unit}</span>
+                       :<span className="cnt-pk-dim">—</span>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+
+          {/* History */}
+          {countHistory.length>0&&<div className="box" style={{marginTop:8}}>
+            <div className="stt">ประวัติการนับสต็อก</div>
+            {countHistory.slice(0,20).map((h,i)=>(
+              <div key={i} className="hist-row">
+                <span style={{color:C.textMuted}}>{h.counted_at} · {h.product_name}</span>
+                <span><span style={{color:C.textDim}}>{h.previous_stock}</span><span style={{color:C.textMuted}}> → </span><b style={{color:C.green}}>{h.counted_stock}</b></span>
+              </div>
+            ))}
+          </div>}
         </div>}
 
         {/* CATEGORIES */}
@@ -513,9 +641,11 @@ export default function App() {
               <div style={{fontSize:11,color:C.green,fontWeight:700,marginBottom:10,letterSpacing:1,textTransform:"uppercase"}}>คำสั่งที่ใช้ได้ในกลุ่ม</div>
               {[
                 ["สต็อก","รายงานสต็อกทั้งหมดแยกหมวดหมู่"],
-                ["แจ้งเตือน","รายการที่ต้องซื้อ + ยอดเงินรวม"],
+                ["แจ้งเตือน","รายการที่ต้องซื้อ + ยอดเงินรวม (พร้อมแปลงเป็นลัง)"],
+                ["ใบนับ","ดูใบนับสต็อกพร้อมรายชื่อสินค้า"],
+                ["นับ ช้าง 36","บันทึกสต็อกจากการนับจริง (ไม่ใช่ delta)"],
                 ["ดู ช้าง","ดูข้อมูลสินค้าชิ้นเดียว"],
-                ["อัปเดต ช้าง 24","เพิ่มสต็อก 24 (ใส่ติดลบเพื่อลด)"],
+                ["อัปเดต ช้าง 24","เพิ่ม/ลดสต็อก (ใส่ติดลบเพื่อลด)"],
                 ["ช่วยด้วย","ดูคำสั่งทั้งหมด"],
               ].map(([cmd,desc])=>(
                 <div key={cmd} className="cmd-row">
@@ -541,7 +671,7 @@ export default function App() {
       {/* Bottom Nav */}
       <nav className="bn">
         <div className="bni">
-          {[["dashboard","หน้าหลัก",<IH/>],["stock","สต็อก",<IB/>],["categories","หมวดหมู่",<IC/>],["settings","ตั้งค่า",<IS/>]].map(([id,label,icon])=>(
+          {[["dashboard","หน้าหลัก",<IH/>],["stock","สต็อก",<IB/>],["count","นับสต็อก",<IK/>],["categories","หมวดหมู่",<IC/>],["settings","ตั้งค่า",<IS/>]].map(([id,label,icon])=>(
             <button key={id} className={`bnt${tab===id?" on":""}`} onClick={()=>setTab(id)}>
               {icon}{label}
               {id==="stock"&&alerts.length>0&&<span className="rb" style={{position:"absolute",marginTop:-28,marginLeft:12,fontSize:9,padding:"0 4px"}}>{alerts.length}</span>}
@@ -564,6 +694,22 @@ export default function App() {
         <div className="g2">
           <Field label="แจ้งเตือนเมื่อต่ำกว่า"><input type="number" min="1" value={form.alert_threshold} onChange={e=>setForm({...form,alert_threshold:e.target.value})} placeholder="12"/></Field>
           <Field label="ราคา/หน่วย (บาท)"><input type="number" min="0" value={form.unit_price} onChange={e=>setForm({...form,unit_price:e.target.value})} placeholder="65"/></Field>
+        </div>
+        <div style={{borderTop:`1px solid ${C.border}`,margin:"10px 0 14px",paddingTop:14}}>
+          <div style={{fontSize:10,color:C.green,fontWeight:700,letterSpacing:1,marginBottom:10,textTransform:"uppercase"}}>📦 ขนาดลัง/แพ็ค (ไม่บังคับ)</div>
+          <div className="g2">
+            <Field label={`จำนวน ${form.unit||"หน่วย"} ต่อ 1 ลัง/แพ็ค`}>
+              <input type="number" min="1" value={form.pack_size||""} onChange={e=>setForm({...form,pack_size:e.target.value})} placeholder="เช่น 12, 24"/>
+            </Field>
+            <Field label="เรียกหน่วยรวมว่า">
+              <select value={form.pack_unit||"ลัง"} onChange={e=>setForm({...form,pack_unit:e.target.value})}>
+                {PACK_UNITS.map(u=><option key={u}>{u}</option>)}
+              </select>
+            </Field>
+          </div>
+          {form.pack_size&&+form.pack_size>0&&<div style={{fontSize:11,color:C.green,background:"#001a0a",border:`1px solid ${C.borderGreen}`,borderRadius:7,padding:"6px 10px"}}>
+            ตัวอย่าง: 25 {form.unit||"ขวด"} = <b>{formatPacks(25,{pack_size:+form.pack_size,pack_unit:form.pack_unit||"ลัง",unit:form.unit||"ขวด"})}</b>
+          </div>}
         </div>
         <div className="re">
           <button className="cbtn" onClick={()=>setModal(null)}>ยกเลิก</button>
